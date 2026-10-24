@@ -26,6 +26,9 @@ mod indexed_presets;
 mod web;
 
 #[cfg(target_arch = "wasm32")]
+mod storage;
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
     web::start();
 }

@@ -397,7 +397,7 @@ impl eframe::App for WebShell {
 }
 
 fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn) -> Services {
-    Services {
+    let mut services = Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
             photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
@@ -455,7 +455,10 @@ fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::Cu
         load_prefs: Some(Box::new(|| local_storage()?.get_item(PREFS_KEY).ok().flatten())),
         save_prefs: Some(Box::new(|text: &str| local_storage().ok_or("no localStorage")?.set_item(PREFS_KEY, text).map_err(|e| format!("{e:?}")))),
         ..Default::default()
-    }
+    };
+    // A page that serves the app may offer its own file storage (`window.craftStorage`).
+    crate::storage::install(&mut services);
+    services
 }
 
 const PREFS_KEY: &str = "photocraft.preferences";

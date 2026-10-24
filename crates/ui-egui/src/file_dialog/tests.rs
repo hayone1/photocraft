@@ -848,6 +848,40 @@ fn failed_deferred_save_preserves_both_identities_and_the_selected_tab() {
     assert!(written.borrow().is_empty());
 }
 
+/// A host's storage on the web answers File › Open with the file's path there: the document is named
+/// after the file and keeps the path, so File › Save writes back to it without asking.
+#[test]
+fn a_file_from_a_hosts_storage_keeps_its_path_for_save() {
+    let (mut app, open, written) = app();
+    let ctx = egui::Context::default();
+    app.services.import = Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
+        photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+    }));
+    let psd = photocraft_io::export(&app.session.active().unwrap().doc, "art.psd", &Default::default()).unwrap().bytes;
+    app.open_dialog_file().unwrap();
+    app.poll_file_dialog(&ctx, None);
+    answer(&open, Some(FileDialogAnswer::Contents("cloud:home/art/photo.psd".into(), psd)));
+    app.poll_file_dialog(&ctx, None);
+    assert!(!app.ui.status_error, "{}", app.ui.status);
+    let opened = app.session.active().unwrap();
+    assert_eq!(opened.doc.name, "photo.psd");
+    assert_eq!(opened.path.as_deref(), Some("cloud:home/art/photo.psd"));
+    menus::invoke(&mut app, &ctx, "file.save", json!({})).unwrap();
+    app.poll_file_dialog(&ctx, None);
+    assert!(open.borrow().is_empty(), "Save asked where to save");
+    assert_eq!(written.borrow().last().map(String::as_str), Some("cloud:home/art/photo.psd"));
+}
+
+#[test]
+fn host_paths_have_a_scheme_and_bare_names_and_drives_do_not() {
+    for path in ["cloud:home/photo.psd", "team-drive:a/b.png", "s3+x:bucket/k"] {
+        assert!(is_host_path(path), "{path}");
+    }
+    for name in ["photo.psd", "C:\\pics\\photo.psd", "c:/pics/photo.psd", ":nothing", "1x:y", "a b:c", "photo:1.psd"] {
+        assert!(!is_host_path(name), "{name}");
+    }
+}
+
 #[test]
 fn an_answer_of_the_wrong_kind_is_an_error_not_a_crash() {
     let (mut app, open, written) = app();
