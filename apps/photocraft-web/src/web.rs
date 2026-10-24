@@ -14,7 +14,7 @@ use photocraft_ui_egui::theme::ThemeKind;
 use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp, Services};
 use wasm_bindgen::JsCast as _;
 
-type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+pub(crate) type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// Everything File › Open reads: PhotoCraft, Photoshop, OpenRaster, Krita and Affinity documents, flat images, and
 /// Photoshop brushes (.abr), gradients (.grd), layer styles (.asl) and swatches (.aco, .act, .ase), which go to the preset libraries.
@@ -90,6 +90,13 @@ pub fn start() {
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
                     let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));
+                    // `window.photocraft`: the page's control channel (crate::api).
+                    let (control_tx, control_rx) = std::sync::mpsc::channel();
+                    crate::api::connect(control_tx, inbox.clone(), cc.egui_ctx.clone());
+                    if let Err(e) = crate::api::install() {
+                        log::error!("photocraft-web: couldn't install window.photocraft: {e:?}");
+                    }
+                    app = app.with_control(control_rx);
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
@@ -364,6 +371,7 @@ impl eframe::App for WebShell {
         self.app.logic_frame(ctx, frame);
         self.save_presets(ctx);
         self.app.finish_type_reset_logic(ctx);
+        crate::api::poll_replies();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -393,6 +401,7 @@ impl eframe::App for WebShell {
         self.app.ui_frame(ui, frame);
         self.save_presets(ui.ctx());
         self.app.finish_type_reset_pass(ui.ctx());
+        crate::api::poll_replies();
     }
 }
 
