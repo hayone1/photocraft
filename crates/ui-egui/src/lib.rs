@@ -483,6 +483,19 @@ pub(crate) fn saved_revision_after_write(confirmed: bool, written: u64, previous
     if confirmed { written } else { previous }
 }
 
+/// A save written to a host's storage, waiting for the host to confirm it: what
+/// [`PhotocraftApp::saved`] records once it does.
+pub(crate) struct HostWrite {
+    /// The host's id for the write ([`Services::host_write_pending`]).
+    pub(crate) id: u64,
+    pub(crate) doc: DocId,
+    /// The revision written.
+    pub(crate) revision: u64,
+    pub(crate) path: String,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) copy: bool,
+}
+
 /// Who a finished save serves.
 #[derive(Clone, Copy)]
 pub(crate) enum SaveKind {
@@ -592,10 +605,11 @@ pub struct Services {
     /// cancel and which reports nothing back), so a save through it names the document but
     /// leaves its changes unsaved and the leave-page guard armed (#4962).
     pub write_unconfirmed: bool,
-    /// Web: whether a write that `write` handed to a host's storage (`window.craftStorage`) is
-    /// still going. The host reports back through [`PhotocraftApp::host_write_settled`]; until
-    /// then it counts as a save in progress, so closing a document or the window waits for it.
-    pub write_in_flight: Option<Box<dyn Fn() -> bool>>,
+    /// Web: the id of the latest write that `write` handed to a host's storage
+    /// (`window.craftStorage`) and that the host hasn't answered yet; `None` once all are done.
+    /// The host answers each through [`PhotocraftApp::host_write_settled`]. Until then the write
+    /// counts as a save in progress, so closing a document or the window waits for it.
+    pub host_write_pending: Option<Box<dyn Fn() -> Option<u64>>>,
     /// Encode and write in one step on a worker thread, so a large save doesn't freeze the
     /// window (#2017). With background jobs on, saves use it instead of `export` and `write`.
     pub save_file: Option<SaveFileFn>,
@@ -1007,9 +1021,9 @@ pub struct PhotocraftApp {
     pub(crate) updates_rt: updates_ui::Runtime,
     /// Close, Revert or Exit parked behind the unsaved-changes prompt (see `discard_ui`).
     pub(crate) discard: Option<discard_ui::Prompt>,
-    /// Saves written to a host's storage that it hasn't confirmed yet: (document, revision
-    /// written, host path). See [`Self::host_write_settled`].
-    pub(crate) host_writes: Vec<(DocId, u64, String)>,
+    /// Saves written to a host's storage that it hasn't confirmed yet (see
+    /// [`Self::host_write_settled`]).
+    pub(crate) host_writes: Vec<HostWrite>,
     /// The Open or Save dialog in progress, and the action waiting on it (see `file_dialog`).
     pub(crate) file_dialog: Option<file_dialog::Pending>,
     /// A Save As to a layered TIFF parked behind the TIFF Options prompt (see `tiff_options_ui`).
@@ -2032,37 +2046,35 @@ impl PhotocraftApp {
         let (bytes, warnings) = export(&st.doc, &path, settings)?;
         let write = self.services.write.as_mut().ok_or("no writer configured")?;
         write(&path, &bytes)?;
-        let revision = saved_revision_after_write(!self.services.write_unconfirmed, written, previous);
-        // A host's storage confirms the write later: the document counts as saved once it does.
-        if !copy && file_dialog::is_host_path(&path) && self.services.write_in_flight.as_ref().is_some_and(|f| f()) {
-            self.host_writes.push((doc, written, path.clone()));
+        // A host's storage confirms the write later: the save is recorded (the document's path and
+        // saved state, Open Recent, Save Document hooks) only once it does.
+        if file_dialog::is_host_path(&path)
+            && let Some(id) = self.services.host_write_pending.as_ref().and_then(|pending| pending())
+        {
+            self.host_writes.push(HostWrite { id, doc, revision: written, path: path.clone(), warnings: warnings.clone(), copy });
+            return Ok(Some((path, warnings)));
         }
+        let revision = saved_revision_after_write(!self.services.write_unconfirmed, written, previous);
         self.saved(doc, revision, &path, &warnings, copy);
         Ok(Some((path, warnings)))
     }
 
-    /// A write that `write` handed to a host's storage has finished ([`Services::write_in_flight`]).
-    /// When it worked, a document saved to `path` counts as saved at the revision written, and an
-    /// unsaved-changes prompt that waited for it moves on. When it failed, the document stays
-    /// unsaved, the status says why, and the prompt asks again.
-    pub fn host_write_settled(&mut self, ctx: &egui::Context, path: &str, result: Result<(), String>) {
-        let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.host_writes).into_iter().partition(|(_, _, p)| p == path);
-        self.host_writes = rest;
+    /// The host's storage answered write `id` ([`Services::host_write_pending`]). When it stored
+    /// the file, the save is recorded at the revision written, and an unsaved-changes prompt that
+    /// waited for it moves on if nothing changed the document since. When it failed, nothing is
+    /// recorded: the document stays as it was, the status says why, and the prompt asks again.
+    pub fn host_write_settled(&mut self, ctx: &egui::Context, id: u64, result: Result<(), String>) {
+        let Some(i) = self.host_writes.iter().position(|w| w.id == id) else { return };
+        let w = self.host_writes.remove(i);
         if let Err(e) = result {
             self.ui.status = format!("Couldn't save: {e}");
             self.ui.status_error = true;
             return;
         }
-        for (doc, written, _) in done {
-            let _ = self.with_document(doc, |app| {
-                if let Some(st) = app.session.active_mut()
-                    && st.path.as_deref() == Some(path)
-                {
-                    st.saved_revision = written;
-                }
-                Ok(())
-            });
-            discard_ui::saved_document(self, ctx, doc);
+        self.saved(w.doc, w.revision, &w.path, &w.warnings, w.copy);
+        // A Save Document hook (or the user) may have changed the document since it was written.
+        if !self.session.documents().iter().any(|st| st.doc.id == w.doc && st.is_dirty()) {
+            discard_ui::saved_document(self, ctx, w.doc);
         }
     }
 
@@ -2222,7 +2234,7 @@ impl PhotocraftApp {
 
     /// A save is running in the background.
     pub(crate) fn saving(&self) -> bool {
-        !self.jobs.saves.is_empty() || self.services.write_in_flight.as_ref().is_some_and(|f| f())
+        !self.jobs.saves.is_empty() || self.services.host_write_pending.as_ref().is_some_and(|pending| pending().is_some())
     }
 
     /// Save through the control session's capability-scoped writer. No file

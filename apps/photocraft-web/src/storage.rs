@@ -23,6 +23,7 @@
 //! picker can't open.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use photocraft_ui_egui::file_dialog::is_host_path;
@@ -38,20 +39,51 @@ fn storage() -> Option<JsValue> {
 }
 
 thread_local! {
-    /// Writes to the host that haven't finished yet.
-    static IN_FLIGHT: Cell<usize> = const { Cell::new(0) };
-    /// Writes that finished since the web shell last looked: (host path, result), for
+    /// Writes waiting for the host, made one at a time in the order the app asked, so a later
+    /// save of a file is never overwritten by an earlier one: (id, host path, bytes).
+    static QUEUE: RefCell<VecDeque<(u64, String, Vec<u8>)>> = const { RefCell::new(VecDeque::new()) };
+    /// The write the host is making now.
+    static WRITING: Cell<Option<u64>> = const { Cell::new(None) };
+    static LAST_ID: Cell<u64> = const { Cell::new(0) };
+    /// Writes that finished since the web shell last looked: (id, result), for
     /// [`photocraft_ui_egui::PhotocraftApp::host_write_settled`] ([`take_settled`]).
-    static SETTLED: RefCell<Vec<(String, Result<(), String>)>> = const { RefCell::new(Vec::new()) };
+    static SETTLED: RefCell<Vec<(u64, Result<(), String>)>> = const { RefCell::new(Vec::new()) };
 }
 
-fn in_flight() -> bool {
-    IN_FLIGHT.with(Cell::get) > 0
+/// The id of the latest write to the host that hasn't finished.
+fn pending() -> Option<u64> {
+    QUEUE.with(|q| q.borrow().back().map(|w| w.0)).or_else(|| WRITING.with(Cell::get))
 }
 
 /// The writes to the host that finished since the last call.
-pub fn take_settled() -> Vec<(String, Result<(), String>)> {
+pub fn take_settled() -> Vec<(u64, Result<(), String>)> {
     SETTLED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Queue a write to the host; the first one starts the writer, which works through the queue.
+fn enqueue(path: String, bytes: Vec<u8>, ctx: egui::Context) {
+    let id = LAST_ID.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    let start = pending().is_none();
+    QUEUE.with(|q| q.borrow_mut().push_back((id, path, bytes)));
+    if !start {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        while let Some((id, path, bytes)) = QUEUE.with(|q| q.borrow_mut().pop_front()) {
+            WRITING.with(|w| w.set(Some(id)));
+            let args = [JsValue::from(&path), js_sys::Uint8Array::from(bytes.as_slice()).into()];
+            let result = call("write", &args).await.map(|_| ()).map_err(|e| {
+                log::error!("photocraft-web: craftStorage.write of {path} failed: {e:?}");
+                e.dyn_ref::<js_sys::Error>().map_or_else(|| e.as_string().unwrap_or_else(|| "the host couldn't store the file".into()), |e| e.message().into())
+            });
+            WRITING.with(|w| w.set(None));
+            SETTLED.with(|s| s.borrow_mut().push((id, result)));
+            ctx.request_repaint();
+        }
+    });
 }
 
 async fn call(method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
@@ -96,24 +128,12 @@ pub fn install(services: &mut Services, ctx: egui::Context) {
         }));
     }
     if let Some(mut device_write) = services.write.take() {
-        services.write_in_flight = Some(Box::new(in_flight));
+        services.host_write_pending = Some(Box::new(pending));
         services.write = Some(Box::new(move |path: &str, bytes: &[u8]| {
             if !is_host_path(path) || storage().is_none() {
                 return device_write(path, bytes);
             }
-            let (path, ctx) = (path.to_string(), ctx.clone());
-            let args = [JsValue::from(&path), js_sys::Uint8Array::from(bytes).into()];
-            IN_FLIGHT.with(|n| n.set(n.get() + 1));
-            wasm_bindgen_futures::spawn_local(async move {
-                let result = call("write", &args).await.map(|_| ()).map_err(|e| {
-                    log::error!("photocraft-web: craftStorage.write failed: {e:?}");
-                    e.dyn_ref::<js_sys::Error>()
-                        .map_or_else(|| e.as_string().unwrap_or_else(|| "the host couldn't store the file".into()), |e| e.message().into())
-                });
-                IN_FLIGHT.with(|n| n.set(n.get().saturating_sub(1)));
-                SETTLED.with(|s| s.borrow_mut().push((path, result)));
-                ctx.request_repaint();
-            });
+            enqueue(path.to_string(), bytes.to_vec(), ctx.clone());
             Ok(())
         }));
     }

@@ -364,8 +364,8 @@ impl eframe::App for WebShell {
             });
         }
         self.serve_fonts(ctx);
-        for (path, result) in crate::storage::take_settled() {
-            self.app.host_write_settled(ctx, &path, result);
+        for (id, result) in crate::storage::take_settled() {
+            self.app.host_write_settled(ctx, id, result);
         }
         self.app.logic_frame(ctx, frame);
         self.save_presets(ctx);

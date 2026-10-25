@@ -245,6 +245,8 @@ pub(crate) fn saved_document(app: &mut PhotocraftApp, ctx: &egui::Context, doc: 
     // Still the prompt that asked (quitting may have replaced it meanwhile).
     if !app.save_options_open()
         && app.discard.as_ref().and_then(|p| p.docs.first()) == Some(&doc)
+        // A write the host's storage hasn't confirmed yet: its answer calls this again.
+        && !app.host_writes.iter().any(|w| w.doc == doc)
         && index_of(app, doc).is_some_and(|i| app.services.write_unconfirmed || !app.session.documents()[i].is_dirty())
     {
         advance(app, ctx);
@@ -1020,6 +1022,7 @@ mod tests {
         for works in [false, true] {
             let busy: Rc<Cell<bool>> = Rc::default();
             let (b, b2) = (busy.clone(), busy.clone());
+            let id = 7;
             let mut app = app_with_docs(1);
             make_dirty(&mut app, 0);
             app.session.active_mut().unwrap().path = Some(path.into());
@@ -1029,7 +1032,7 @@ mod tests {
                 b.set(true);
                 Ok(())
             }));
-            app.services.write_in_flight = Some(Box::new(move || b2.get()));
+            app.services.host_write_pending = Some(Box::new(move || b2.get().then_some(id)));
             let mut h = prompt_for(app, "file.close", egui::os::OperatingSystem::Windows);
             h.key_press(Key::Y);
             h.run_steps(3);
@@ -1037,7 +1040,10 @@ mod tests {
             assert_eq!(h.state().session.documents().len(), 1, "open until the host answers");
             busy.set(false);
             let ctx = h.ctx.clone();
-            h.state_mut().host_write_settled(&ctx, path, if works { Ok(()) } else { Err("offline".into()) });
+            // An answer for another write changes nothing.
+            h.state_mut().host_write_settled(&ctx, id + 1, Ok(()));
+            assert_eq!(h.state().host_writes.len(), 1);
+            h.state_mut().host_write_settled(&ctx, id, if works { Ok(()) } else { Err("offline".into()) });
             h.run_steps(3);
             if works {
                 assert!(h.state().session.documents().is_empty(), "closed once the host had it");
