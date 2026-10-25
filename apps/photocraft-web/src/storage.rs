@@ -48,6 +48,13 @@ thread_local! {
     /// Writes that finished since the web shell last looked: (id, result), for
     /// [`photocraft_ui_egui::PhotocraftApp::host_write_settled`] ([`take_settled`]).
     static SETTLED: RefCell<Vec<(u64, Result<(), String>)>> = const { RefCell::new(Vec::new()) };
+    /// The app's egui context, asked for a frame when the host answers a write.
+    static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+}
+
+/// The app's egui context, so the host's answers reach the app on the next frame.
+pub fn set_context(ctx: egui::Context) {
+    CTX.with(|c| *c.borrow_mut() = Some(ctx));
 }
 
 /// The id of the latest write to the host that hasn't finished.
@@ -61,7 +68,7 @@ pub fn take_settled() -> Vec<(u64, Result<(), String>)> {
 }
 
 /// Queue a write to the host; the first one starts the writer, which works through the queue.
-fn enqueue(path: String, bytes: Vec<u8>, ctx: egui::Context) {
+fn enqueue(path: String, bytes: Vec<u8>) {
     let id = LAST_ID.with(|n| {
         n.set(n.get() + 1);
         n.get()
@@ -81,7 +88,7 @@ fn enqueue(path: String, bytes: Vec<u8>, ctx: egui::Context) {
             });
             WRITING.with(|w| w.set(None));
             SETTLED.with(|s| s.borrow_mut().push((id, result)));
-            ctx.request_repaint();
+            CTX.with(|c| c.borrow().as_ref().map(egui::Context::request_repaint));
         }
     });
 }
@@ -95,7 +102,7 @@ async fn call(method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
 
 /// Wrap the file dialog and the writer in `services` so they offer the host's storage when the
 /// page has one. The device's own dialog and download stay one choice away.
-pub fn install(services: &mut Services, ctx: egui::Context) {
+pub fn install(services: &mut Services) {
     if let Some(device_dialog) = services.file_dialog.take() {
         let device_dialog = Rc::new(RefCell::new(device_dialog));
         services.file_dialog = Some(Box::new(move |request, parent, reply| {
@@ -133,7 +140,7 @@ pub fn install(services: &mut Services, ctx: egui::Context) {
             if !is_host_path(path) || storage().is_none() {
                 return device_write(path, bytes);
             }
-            enqueue(path.to_string(), bytes.to_vec(), ctx.clone());
+            enqueue(path.to_string(), bytes.to_vec());
             Ok(())
         }));
     }
