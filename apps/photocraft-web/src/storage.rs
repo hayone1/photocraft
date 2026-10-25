@@ -16,6 +16,10 @@
 //! Host paths have a scheme of their own, such as `cloud:home/art/photo.psd`
 //! ([`photocraft_ui_egui::file_dialog::is_host_path`]): a document opened from one keeps it, so
 //! File › Save writes back there without asking. Without `window.craftStorage` nothing changes.
+//!
+//! Browsers open a file picker only during a click: when the user picks "This device" in the host's
+//! own dialog, `chooseOpen` should resolve with "device" right from that click, or the browser's
+//! picker can't open.
 
 use std::cell::RefCell;
 use std::rc::Rc;
