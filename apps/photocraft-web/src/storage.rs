@@ -8,7 +8,8 @@
 //!   async chooseOpen(extensions /* ["psd", …] or null */) { … },
 //!   // File › Save As: a path in the host's storage, "device" for a download, or null.
 //!   async chooseSave(suggested /* a file name, or the document's host path */) { … },
-//!   // Writes a file the user saved to a host path; the host reports progress and errors itself.
+//!   // Writes a file the user saved to a host path. The document counts as saved once it
+//!   // resolves; a rejection leaves it unsaved and shows the error.
 //!   async write(path, bytes /* Uint8Array */) { … },
 //! };
 //! ```
@@ -21,7 +22,7 @@
 //! own dialog, `chooseOpen` should resolve with "device" right from that click, or the browser's
 //! picker can't open.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use photocraft_ui_egui::file_dialog::is_host_path;
@@ -36,6 +37,23 @@ fn storage() -> Option<JsValue> {
     (!storage.is_undefined() && !storage.is_null()).then_some(storage)
 }
 
+thread_local! {
+    /// Writes to the host that haven't finished yet.
+    static IN_FLIGHT: Cell<usize> = const { Cell::new(0) };
+    /// Writes that finished since the web shell last looked: (host path, result), for
+    /// [`photocraft_ui_egui::PhotocraftApp::host_write_settled`] ([`take_settled`]).
+    static SETTLED: RefCell<Vec<(String, Result<(), String>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn in_flight() -> bool {
+    IN_FLIGHT.with(Cell::get) > 0
+}
+
+/// The writes to the host that finished since the last call.
+pub fn take_settled() -> Vec<(String, Result<(), String>)> {
+    SETTLED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
 async fn call(method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
     let storage = storage().ok_or(JsValue::NULL)?;
     let f: js_sys::Function = js_sys::Reflect::get(&storage, &method.into())?.dyn_into()?;
@@ -45,7 +63,7 @@ async fn call(method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
 
 /// Wrap the file dialog and the writer in `services` so they offer the host's storage when the
 /// page has one. The device's own dialog and download stay one choice away.
-pub fn install(services: &mut Services) {
+pub fn install(services: &mut Services, ctx: egui::Context) {
     if let Some(device_dialog) = services.file_dialog.take() {
         let device_dialog = Rc::new(RefCell::new(device_dialog));
         services.file_dialog = Some(Box::new(move |request, parent, reply| {
@@ -78,15 +96,23 @@ pub fn install(services: &mut Services) {
         }));
     }
     if let Some(mut device_write) = services.write.take() {
+        services.write_in_flight = Some(Box::new(in_flight));
         services.write = Some(Box::new(move |path: &str, bytes: &[u8]| {
             if !is_host_path(path) || storage().is_none() {
                 return device_write(path, bytes);
             }
-            let args = [JsValue::from(path), js_sys::Uint8Array::from(bytes).into()];
+            let (path, ctx) = (path.to_string(), ctx.clone());
+            let args = [JsValue::from(&path), js_sys::Uint8Array::from(bytes).into()];
+            IN_FLIGHT.with(|n| n.set(n.get() + 1));
             wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = call("write", &args).await {
+                let result = call("write", &args).await.map(|_| ()).map_err(|e| {
                     log::error!("photocraft-web: craftStorage.write failed: {e:?}");
-                }
+                    e.dyn_ref::<js_sys::Error>()
+                        .map_or_else(|| e.as_string().unwrap_or_else(|| "the host couldn't store the file".into()), |e| e.message().into())
+                });
+                IN_FLIGHT.with(|n| n.set(n.get().saturating_sub(1)));
+                SETTLED.with(|s| s.borrow_mut().push((path, result)));
+                ctx.request_repaint();
             });
             Ok(())
         }));

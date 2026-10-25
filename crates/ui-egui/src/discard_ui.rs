@@ -1011,6 +1011,46 @@ mod tests {
         assert!(h.state().session.documents().is_empty(), "closed after one write");
     }
 
+    /// On the web a save to a host's storage waits for the host: the tab closes once the host
+    /// confirms the write, and stays open and unsaved, with the prompt back, when it fails.
+    #[test]
+    fn saving_from_the_prompt_to_a_host_waits_for_the_host() {
+        use std::{cell::Cell, rc::Rc};
+        let path = "cloud:home/pics/kept.psd";
+        for works in [false, true] {
+            let busy: Rc<Cell<bool>> = Rc::default();
+            let (b, b2) = (busy.clone(), busy.clone());
+            let mut app = app_with_docs(1);
+            make_dirty(&mut app, 0);
+            app.session.active_mut().unwrap().path = Some(path.into());
+            app.services.write_unconfirmed = true;
+            app.services.export = Some(Box::new(|_: &photocraft_doc::Document, _: &str, _: &crate::ExportSettings| Ok((b"out".to_vec(), Vec::new()))));
+            app.services.write = Some(Box::new(move |_: &str, _: &[u8]| {
+                b.set(true);
+                Ok(())
+            }));
+            app.services.write_in_flight = Some(Box::new(move || b2.get()));
+            let mut h = prompt_for(app, "file.close", egui::os::OperatingSystem::Windows);
+            h.key_press(Key::Y);
+            h.run_steps(3);
+            assert!(h.state().saving(), "the host is still writing");
+            assert_eq!(h.state().session.documents().len(), 1, "open until the host answers");
+            busy.set(false);
+            let ctx = h.ctx.clone();
+            h.state_mut().host_write_settled(&ctx, path, if works { Ok(()) } else { Err("offline".into()) });
+            h.run_steps(3);
+            if works {
+                assert!(h.state().session.documents().is_empty(), "closed once the host had it");
+                assert!(h.state().discard.is_none());
+            } else {
+                assert_eq!(h.state().session.documents().len(), 1, "kept: the host lost it");
+                assert!(h.state().session.documents()[0].is_dirty());
+                assert!(h.state().discard.is_some(), "the prompt asks again");
+                assert!(h.state().ui.status_error);
+            }
+        }
+    }
+
     #[path = "tiff_tests.rs"]
     mod tiff_tests;
 

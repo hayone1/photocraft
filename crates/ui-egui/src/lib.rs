@@ -592,6 +592,10 @@ pub struct Services {
     /// cancel and which reports nothing back), so a save through it names the document but
     /// leaves its changes unsaved and the leave-page guard armed (#4962).
     pub write_unconfirmed: bool,
+    /// Web: whether a write that `write` handed to a host's storage (`window.craftStorage`) is
+    /// still going. The host reports back through [`PhotocraftApp::host_write_settled`]; until
+    /// then it counts as a save in progress, so closing a document or the window waits for it.
+    pub write_in_flight: Option<Box<dyn Fn() -> bool>>,
     /// Encode and write in one step on a worker thread, so a large save doesn't freeze the
     /// window (#2017). With background jobs on, saves use it instead of `export` and `write`.
     pub save_file: Option<SaveFileFn>,
@@ -1003,6 +1007,9 @@ pub struct PhotocraftApp {
     pub(crate) updates_rt: updates_ui::Runtime,
     /// Close, Revert or Exit parked behind the unsaved-changes prompt (see `discard_ui`).
     pub(crate) discard: Option<discard_ui::Prompt>,
+    /// Saves written to a host's storage that it hasn't confirmed yet: (document, revision
+    /// written, host path). See [`Self::host_write_settled`].
+    pub(crate) host_writes: Vec<(DocId, u64, String)>,
     /// The Open or Save dialog in progress, and the action waiting on it (see `file_dialog`).
     pub(crate) file_dialog: Option<file_dialog::Pending>,
     /// A Save As to a layered TIFF parked behind the TIFF Options prompt (see `tiff_options_ui`).
@@ -1208,6 +1215,7 @@ impl PhotocraftApp {
             prefs_rt: Default::default(),
             updates_rt: Default::default(),
             discard: None,
+            host_writes: Vec::new(),
             file_dialog: None,
             tiff_options: None,
             save_dirs: HashMap::new(),
@@ -2025,8 +2033,37 @@ impl PhotocraftApp {
         let write = self.services.write.as_mut().ok_or("no writer configured")?;
         write(&path, &bytes)?;
         let revision = saved_revision_after_write(!self.services.write_unconfirmed, written, previous);
+        // A host's storage confirms the write later: the document counts as saved once it does.
+        if !copy && file_dialog::is_host_path(&path) && self.services.write_in_flight.as_ref().is_some_and(|f| f()) {
+            self.host_writes.push((doc, written, path.clone()));
+        }
         self.saved(doc, revision, &path, &warnings, copy);
         Ok(Some((path, warnings)))
+    }
+
+    /// A write that `write` handed to a host's storage has finished ([`Services::write_in_flight`]).
+    /// When it worked, a document saved to `path` counts as saved at the revision written, and an
+    /// unsaved-changes prompt that waited for it moves on. When it failed, the document stays
+    /// unsaved, the status says why, and the prompt asks again.
+    pub fn host_write_settled(&mut self, ctx: &egui::Context, path: &str, result: Result<(), String>) {
+        let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.host_writes).into_iter().partition(|(_, _, p)| p == path);
+        self.host_writes = rest;
+        if let Err(e) = result {
+            self.ui.status = format!("Couldn't save: {e}");
+            self.ui.status_error = true;
+            return;
+        }
+        for (doc, written, _) in done {
+            let _ = self.with_document(doc, |app| {
+                if let Some(st) = app.session.active_mut()
+                    && st.path.as_deref() == Some(path)
+                {
+                    st.saved_revision = written;
+                }
+                Ok(())
+            });
+            discard_ui::saved_document(self, ctx, doc);
+        }
     }
 
     /// After `saver` was written to `path`, any other open document bound to that file no longer
@@ -2185,7 +2222,7 @@ impl PhotocraftApp {
 
     /// A save is running in the background.
     pub(crate) fn saving(&self) -> bool {
-        !self.jobs.saves.is_empty()
+        !self.jobs.saves.is_empty() || self.services.write_in_flight.as_ref().is_some_and(|f| f())
     }
 
     /// Save through the control session's capability-scoped writer. No file

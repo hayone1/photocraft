@@ -89,7 +89,10 @@ pub fn start() {
                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
-                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));
+                    let mut app = PhotocraftApp::new(
+                        session,
+                        services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag), cc.egui_ctx.clone()),
+                    );
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
@@ -361,6 +364,9 @@ impl eframe::App for WebShell {
             });
         }
         self.serve_fonts(ctx);
+        for (path, result) in crate::storage::take_settled() {
+            self.app.host_write_settled(ctx, &path, result);
+        }
         self.app.logic_frame(ctx, frame);
         self.save_presets(ctx);
         self.app.finish_type_reset_logic(ctx);
@@ -396,7 +402,7 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn) -> Services {
+fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn, ctx: egui::Context) -> Services {
     let mut services = Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
@@ -457,7 +463,7 @@ fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::Cu
         ..Default::default()
     };
     // A page that serves the app may offer its own file storage (`window.craftStorage`).
-    crate::storage::install(&mut services);
+    crate::storage::install(&mut services, ctx);
     services
 }
 
