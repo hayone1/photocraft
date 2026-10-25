@@ -130,8 +130,14 @@ pub fn install(services: &mut Services) {
                         reply.send(Some(FileDialogAnswer::Contents(path, bytes)));
                     }
                     Ok(c) if c.as_string().is_some_and(|p| is_host_path(&p)) => reply.send(c.as_string().map(FileDialogAnswer::SaveTo)),
-                    // "device", nothing, or a failed host: the browser's own picker or download.
-                    _ => (device_dialog.borrow_mut())(request, None, reply),
+                    // Only the user's own choice opens the browser's picker or download.
+                    Ok(c) if c.as_string().as_deref() == Some("device") => (device_dialog.borrow_mut())(request, None, reply),
+                    // A host that failed or answered something else: nothing was chosen. A device
+                    // save here would also leave a document from the host bound to a download.
+                    other => {
+                        log::error!("photocraft-web: craftStorage didn't answer with a choice: {other:?}");
+                        reply.send(None);
+                    }
                 }
             });
         }));
