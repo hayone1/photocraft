@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 craft-print = { workspace = true }
 craft-ui = { workspace = true }
+craft-web-host = { workspace = true }
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-cms = { workspace = true }

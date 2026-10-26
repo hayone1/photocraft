@@ -36,15 +36,8 @@ pub enum FileDialogRequest {
 /// Whether a picked file's name is a path in a host's own storage, `<scheme>:<folder>/<path>` such
 /// as `cloud:home/art/photo.psd`, rather than a bare file name. On the web, the page that serves the app
 /// can offer such storage next to the device (`apps/photocraft-web/src/storage.rs`); its paths go to
-/// its writer. A one-letter scheme is a Windows drive, not a host.
-pub fn is_host_path(name: &str) -> bool {
-    name.split_once(':').is_some_and(|(scheme, rest)| {
-        rest.contains('/')
-            && scheme.len() > 1
-            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
-    })
-}
+/// its writer. The rule is shared by the Craft apps (`craft-web-host`).
+pub use craft_web_host::is_host_path;
 
 /// The user's choice (a cancelled dialog answers `None`).
 #[derive(Clone, Debug, PartialEq, Eq)]
