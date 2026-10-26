@@ -1622,6 +1622,11 @@ impl PhotocraftApp {
     /// the preferences (`fileHandling.recentFiles`), so it survives a restart; `ui.recent_files`
     /// mirrors it for the menus and the Home screen.
     pub fn push_recent(&mut self, path: &str) {
+        // A file in a host's storage can only be read back through the host's Open dialog, so
+        // Open Recent would list an entry it can't open.
+        if file_dialog::is_host_path(path) {
+            return;
+        }
         let cap = self.recent_cap();
         let mut r = self.session.prefs().file_handling.recent_files.clone();
         r.retain(|p| p != path);
@@ -2023,8 +2028,14 @@ impl PhotocraftApp {
     fn write_save(&mut self, path: String, tiff_layers: Option<bool>, choices: FormatChoices) -> Result<Value, String> {
         let copy = self.saves_copy(&path, tiff_layers)?;
         let settings = choices.apply(ExportSettings { tiff_layers: tiff_layers.unwrap_or(ExportSettings::default().tiff_layers), ..self.save_settings() });
+        let host_writes = self.host_writes.len();
         match self.write_document(path.clone(), &settings, copy)? {
             Some((path, warnings)) => Ok(serde_json::json!({"path": path, "warnings": warnings})),
+            // A write the host's storage confirms later (host_write_settled).
+            None if self.host_writes.len() > host_writes => {
+                let w = self.host_writes.last();
+                Ok(serde_json::json!({"path": path, "warnings": w.map(|w| w.warnings.clone()), "pending": true, "hostWrite": w.map(|w| w.id)}))
+            }
             None => Ok(serde_json::json!({"path": path, "warnings": [], "pending": true, "job": self.jobs.last_started.map(|j| j.0)})),
         }
     }
@@ -2033,7 +2044,8 @@ impl PhotocraftApp {
     /// document's path unless saving a copy. A copy leaves the original's path and unsaved
     /// changes intact. Returns the path and the export warnings (also shown to the user), or
     /// `None` when the save went to a background job (#2017), which finishes it in
-    /// [`jobs_ui::tick`].
+    /// [`jobs_ui::tick`], or to a host's storage, which confirms it later
+    /// ([`Self::host_write_settled`]).
     pub(crate) fn write_document(&mut self, path: String, settings: &ExportSettings, copy: bool) -> Result<Option<(String, Vec<String>)>, String> {
         if self.background_jobs
             && let Some(save) = self.services.save_file.clone()
@@ -2051,8 +2063,8 @@ impl PhotocraftApp {
         if file_dialog::is_host_path(&path)
             && let Some(id) = self.services.host_write_pending.as_ref().and_then(|pending| pending())
         {
-            self.host_writes.push(HostWrite { id, doc, revision: written, path: path.clone(), warnings: warnings.clone(), copy });
-            return Ok(Some((path, warnings)));
+            self.host_writes.push(HostWrite { id, doc, revision: written, path, warnings, copy });
+            return Ok(None);
         }
         let revision = saved_revision_after_write(!self.services.write_unconfirmed, written, previous);
         self.saved(doc, revision, &path, &warnings, copy);

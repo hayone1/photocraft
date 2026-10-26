@@ -95,8 +95,12 @@ pub fn install(services: &mut Services) {
     if let Some(mut device_write) = services.write.take() {
         services.host_write_pending = Some(Box::new(|| WRITES.with(SaveQueue::latest)));
         services.write = Some(Box::new(move |path: &str, bytes: &[u8]| {
-            if !is_host_path(path) || !storage::available() {
+            if !is_host_path(path) {
                 return device_write(path, bytes);
+            }
+            // A document from a host whose storage is gone: a download would lose its place there.
+            if !storage::available() {
+                return Err(format!("{path} is in the page's own storage, which isn't available any more"));
             }
             let (path, bytes) = (path.to_string(), bytes.to_vec());
             WRITES.with(|w| {
